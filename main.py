@@ -17,7 +17,10 @@ Model, per case:
     (weights halving every 24 hours), anchored at the last segment with the
     growth shrunk; the earners' slopes are also shrunk toward the
     cross-trophy median slope. A rate is a ratio of two moving quantities,
-    and its recent dynamics live in both.
+    and its recent dynamics live in both. A trophy whose latest segments
+    lack a rate keeps the segment where its rate was last seen as its
+    anchor - that segment's player count and log-time - never the latest
+    segment's.
   * A segment-level logit trend of the rate itself, its slope shrunk
     toward its tier's median slope and damped for the rare tiers, is
     blended with the counts view (0.62 / 0.38).
@@ -174,6 +177,12 @@ def forecast_case(case):
                          else case["game"]["release_date"])
     checkpoint = parse_time(case["at"])
     target = parse_time(case["target"])
+    if horizon_min <= 0:
+        # No stated horizon: fall back to the checkpoint-to-target span
+        # so the random-walk spread term never silently vanishes and
+        # leaves the forecast overconfident.
+        horizon_min = max(0.0, (target - checkpoint).total_seconds() / 60.0)
+        d_days = horizon_min / 1440.0
 
     def log_time(moment):
         hours = (moment - release).total_seconds() / 3600.0
@@ -192,17 +201,30 @@ def forecast_case(case):
     # which unseen refreshes act when the page has not refreshed in view.
     span_hours = max(0.0, (target - (segs[-1][0] if segs else checkpoint)).total_seconds() / 3600.0)
 
-    # Last non-null rate and earners per trophy (over segments).
+    # Last non-null rate and earners per trophy (over segments). Earners
+    # are counted with the players of the segment where the rate was
+    # actually observed, and that segment's log-time is kept as the
+    # anchor: a rate missing from the latest segments is stale, and
+    # pairing it with the latest (larger) player count would overstate
+    # the earners, while extrapolating from the last segment would
+    # understate how long ago the observation was made.
     last_rate = []
     last_earn = []
+    last_x = []
     for i in range(len(trophies)):
         rate = None
-        for (_, p, rates) in reversed(segs):
+        earn = None
+        x_obs = x_last
+        for k in range(n_seg - 1, -1, -1):
+            _, p, rates = segs[k]
             if i < len(rates) and rates[i] is not None:
                 rate = float(rates[i])
+                earn = rate / 100.0 * float(p or 0)
+                x_obs = seg_x[k]
                 break
         last_rate.append(rate)
-        last_earn.append(rate / 100.0 * p_last if rate is not None else None)
+        last_earn.append(earn)
+        last_x.append(x_obs)
 
     # --- Global players forecast: recent-window weighted log-log fit on
     # segments, anchored at the last segment, growth shrunk. ---
@@ -303,7 +325,7 @@ def forecast_case(case):
             n = len(earn_pts[i])
             w = n / (n + SLOPE_SHRINK)
             b = (w * fit_e[1] + (1.0 - w) * med_slope_e) * (0.5 if tier == "platinum" else 1.0)
-            e_target = e_last * math.exp(b * (x_target - x_last)) ** EARN_DAMP
+            e_target = e_last * math.exp(b * (x_target - last_x[i])) ** EARN_DAMP
             e_target = max(e_target, e_last)
             e_target = min(e_target, p_target)
             r_counts = 100.0 * e_target / p_target
@@ -334,10 +356,10 @@ def forecast_case(case):
             n = len(rate_pts[i])
             w = n / (n + SLOPE_SHRINK)
             b = (w * fit_r[1] + (1.0 - w) * tier_slope) * damp
-            y_trend = logit(r_last) + b * (x_target - x_last)
+            y_trend = logit(r_last) + b * (x_target - last_x[i])
             resid = fit_r[2]
         elif n_seg >= 3:
-            y_trend = logit(r_last) + tier_slope * damp * (x_target - x_last)
+            y_trend = logit(r_last) + tier_slope * damp * (x_target - last_x[i])
 
         if y_counts is not None and y_trend is not None:
             y_med = W_COUNTS * y_counts + (1.0 - W_COUNTS) * y_trend
